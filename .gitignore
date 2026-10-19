@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.zip
+*.log
+
+# Large raw archive data (unzipped NASA benchmark files)
+nasa_smap_data/data/
+nasa_smap_data/irregular/
