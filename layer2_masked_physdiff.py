@@ -64,7 +64,7 @@ def find_path(rel_target):
 TRAIN_DIR = find_path("train")
 LABELS_CSV = find_path("labeled_anomalies.csv")
 
-# Hyperparameters (Lite Masked PhysDiff for fast convergence & edge inference)
+# Hyperparameters
 WIN_SIZE = 32
 DIFF_STEPS = 20
 HIDDEN_DIM = 64
@@ -101,8 +101,25 @@ def load_and_discover_layer1():
     df_irreg = pd.read_parquet(IRREG_PATH)
     df_l1_res = pd.read_parquet(L1_RES_PATH)
     df_l1_win = pd.read_parquet(L1_WIN_PATH)
-    df_labels = pd.read_csv(LABELS_CSV)
-    df_labels = df_labels[df_labels["spacecraft"] == "SMAP"].copy().reset_index(drop=True)
+    df_labels_raw = pd.read_csv(LABELS_CSV)
+    df_labels_raw = df_labels_raw[df_labels_raw["spacecraft"] == "SMAP"].copy().reset_index(drop=True)
+
+    # 1. Deduplicate channels in labeled_anomalies.csv (combines duplicate rows like P-2)
+    consolidated_records = []
+    for cid, grp in df_labels_raw.groupby("chan_id", sort=False):
+        classes = []
+        seqs = []
+        for _, r in grp.iterrows():
+            classes.extend(parse_class_list(r["class"]))
+            seqs.extend(parse_seq_list(r["anomaly_sequences"]))
+        p_type = "point" if "point" in classes and "contextual" not in classes else "contextual"
+        consolidated_records.append({
+            "chan_id": cid,
+            "class": classes,
+            "primary_type": p_type,
+            "anomaly_sequences": seqs
+        })
+    df_labels = pd.DataFrame(consolidated_records)
 
     feat_cols = sorted([c for c in df_irreg.columns if c.startswith("feat_")])
 
@@ -121,6 +138,7 @@ def load_and_discover_layer1():
     w_end_col = next((c for c in ["win_end_pos", "end_pos", "w_end"] if c in win_cols), None)
     orig_s_col = next((c for c in ["orig_idx_start", "orig_start", "start_orig_idx"] if c in win_cols), None)
     orig_e_col = next((c for c in ["orig_idx_end", "orig_end", "end_orig_idx"] if c in win_cols), None)
+    win_score_col = next((c for c in ["trigger_score", "score", "anom_score"] if c in win_cols), None)
 
     meta = {
         "feat_cols": feat_cols,
@@ -134,6 +152,7 @@ def load_and_discover_layer1():
         "w_end_col": w_end_col,
         "orig_s_col": orig_s_col,
         "orig_e_col": orig_e_col,
+        "win_score_col": win_score_col,
     }
     return df_irreg, df_l1_res, df_l1_win, df_labels, meta
 
@@ -277,22 +296,20 @@ class LiteMaskedPhysDiff(nn.Module):
 
 
 # ==============================================================================
-# 4. POINT-ADJUSTED (PA) PROTOCOL HELPER
+# 4. POINT-ADJUSTED (PA) PROTOCOL IDENTICAL FOR BOTH LAYERS
 # ==============================================================================
-def compute_pa_predictions(y_true, y_pred):
+def compute_pa_predictions_event(y_true, y_pred, orig_idx, gt_seqs):
+    """
+    Standard Point-Adjusted (PA) protocol on SMAP anomaly events:
+    If any predicted flag intersects the event interval [s, e], all true anomaly
+    timesteps within that interval are credited as detected.
+    """
     pa_pred = y_pred.copy()
-    n = len(y_true)
-    i = 0
-    while i < n:
-        if y_true[i] == 1:
-            j = i
-            while j < n and y_true[j] == 1:
-                j += 1
-            if np.any(y_pred[i:j] == 1):
-                pa_pred[i:j] = 1
-            i = j
-        else:
-            i += 1
+    for s, e in gt_seqs:
+        mask = (orig_idx >= s) & (orig_idx <= e)
+        if np.any(mask) and np.any(y_true[mask] == 1):
+            if np.any(y_pred[mask] == 1):
+                pa_pred[mask & (y_true == 1)] = 1
     return pa_pred
 
 
@@ -311,8 +328,8 @@ def run_layer2():
 
     print(f"\n[1/4] Layer 1 Schema & Candidate Windows:", flush=True)
     print(f"      Irregular rows : {len(df_irreg):,} | Features D={D}", flush=True)
+    print(f"      Unique channels: {len(df_labels)} (deduplicated P-2)", flush=True)
     print(f"      L1 Windows     : {len(df_l1_win):,} candidate trigger windows", flush=True)
-    print(f"      Cols Detected  : flag='{meta['flag_col']}', score='{meta['score_col']}', idx='{meta['idx_col']}'", flush=True)
 
     all_l2_rows = []
     summary_records = []
@@ -333,9 +350,8 @@ def run_layer2():
 
     for _, row in df_labels.iterrows():
         chan_id = row["chan_id"]
-        gt_classes = parse_class_list(row["class"])
-        gt_primary_type = "point" if "point" in gt_classes and "contextual" not in gt_classes else "contextual"
-        gt_seqs = parse_seq_list(row["anomaly_sequences"])
+        gt_primary_type = row["primary_type"]
+        gt_seqs = row["anomaly_sequences"]
 
         df_c_irreg = df_irreg[df_irreg["chan_id"] == chan_id].sort_values("original_row_idx").reset_index(drop=True)
         df_c_res = df_l1_res[df_l1_res["chan_id"] == chan_id].sort_values(meta["idx_col"]).reset_index(drop=True)
@@ -353,10 +369,12 @@ def run_layer2():
         l1_scores = df_c_res[meta["score_col"]].values.astype(np.float32) if meta["score_col"] in df_c_res else l1_flags.astype(np.float32)
 
         l1_f1 = f1_score(y_true, l1_flags, zero_division=0)
+        l1_pa_preds = compute_pa_predictions_event(y_true, l1_flags, orig_idx, gt_seqs)
+        l1_paf1 = f1_score(y_true, l1_pa_preds, zero_division=0)
 
-        # If Layer 1 routed 0 windows, Layer 2 sleeps completely (100% compute saved)
+        # If Layer 1 routed 0 windows, Layer 2 completely sleeps
         if df_c_win.empty or np.sum(l1_flags) == 0:
-            print(f"{chan_id:<6} {0:>6} {0:>5} {'0%':>6} {l1_f1:>6.3f} {l1_f1:>6.3f} {0.0:>7.3f} {'none':<11} {gt_primary_type:<11}", flush=True)
+            print(f"{chan_id:<6} {0:>6} {0:>5} {'0%':>6} {l1_f1:>6.3f} {l1_f1:>6.3f} {l1_paf1:>7.3f} {'none':<11} {gt_primary_type:<11}", flush=True)
             df_c_out = df_c_res.copy()
             df_c_out["l2_flag"] = 0
             df_c_out["l2_phys_score"] = 0.0
@@ -371,19 +389,15 @@ def run_layer2():
         train_path = os.path.join(TRAIN_DIR, f"{chan_id}.npy")
         train_mat = np.load(train_path).astype(np.float32)
 
-        mu = np.mean(train_mat, axis=0, keepdims=True)
-        sigma = np.std(train_mat, axis=0, keepdims=True)
-        sigma_safe = np.where(sigma < 1e-3, 1.0, sigma)
+        train_mu = np.mean(train_mat, axis=0, keepdims=True)
+        train_sigma = np.std(train_mat, axis=0, keepdims=True)
+        train_sigma_safe = np.where(train_sigma < 1e-3, 1.0, train_sigma)
 
-        X_train_norm = np.clip((train_mat - mu) / sigma_safe, -8.0, 8.0)
-        X_test_norm = np.clip((X_test_raw - mu) / sigma_safe, -8.0, 8.0)
+        train_mu_p0 = float(train_mu[0, 0])
+        train_std_p0 = float(train_sigma[0, 0])
 
-        train_std_0 = float(np.std(train_mat[:, 0]))
-        test_std_0 = float(np.std(X_test_raw[:, 0]))
-        test_range_0 = float(np.ptp(X_test_raw[:, 0]))
-
-        # Flat Channel Defense: If sensor is completely stationary with zero dynamics in test
-        is_dead_flat_channel = (test_std_0 < 0.005 or test_range_0 < 0.01)
+        X_train_norm = np.clip((train_mat - train_mu) / train_sigma_safe, -8.0, 8.0)
+        X_test_norm = np.clip((X_test_raw - train_mu) / train_sigma_safe, -8.0, 8.0)
 
         # Slice training windows with simulated blackout masks
         train_wins, train_masks = [], []
@@ -403,7 +417,7 @@ def run_layer2():
         t_M = torch.tensor(np.array(train_masks), dtype=torch.float32, device=DEVICE)
 
         # ----------------------------------------------------------------------
-        # B. Train LiteMaskedPhysDiff Model
+        # B. Train LiteMaskedPhysDiff
         # ----------------------------------------------------------------------
         model = LiteMaskedPhysDiff(in_dim=D, hidden_dim=HIDDEN_DIM, n_steps=DIFF_STEPS).to(DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
@@ -432,34 +446,48 @@ def run_layer2():
                     break
 
         # ----------------------------------------------------------------------
-        # C. Physics Prior Calibration on Nominal Training Distribution
+        # C. Calibrate Separate Primary vs Auxiliary Reconstruction Errors
         # ----------------------------------------------------------------------
         model.eval()
         with torch.no_grad():
             ones_M = torch.ones_like(t_X)
-            x0_rec, pl_tr, ph_tr, pl_rec, ph_rec = model.reconstruct_window(t_X, ones_M)
+            x0_rec_tr, pl_in_tr, ph_in_tr, pl_rec_tr, ph_rec_tr = model.reconstruct_window(t_X, ones_M)
             
-            # 98th percentile envelope of nominal high-frequency and low-frequency priors
-            ph_98 = float(np.percentile(torch.abs(ph_tr[:, :, 0]).numpy(), 98.0))
-            pl_dev_98 = float(np.percentile(torch.abs(pl_tr[:, :, 0] - mu[0, 0]).numpy(), 98.0))
+            # Primary sensor (feat_00) diffusion reconstruction errors
+            err_p0_hf_tr = torch.abs(ph_in_tr[:, :, 0] - ph_rec_tr[:, :, 0]).cpu().numpy()
+            err_p0_lf_tr = torch.abs(pl_in_tr[:, :, 0] - pl_rec_tr[:, :, 0]).cpu().numpy()
+            err_p0_tr = 0.5 * err_p0_hf_tr + 0.5 * err_p0_lf_tr
             
-            # Reconstruction residual on training windows
-            rec_err_tr = torch.abs(t_X - x0_rec)[:, :, 0].numpy()
-            tau_rec_step = float(np.percentile(rec_err_tr, 98.0))
-            tau_rec_win = float(np.percentile(np.mean(rec_err_tr, axis=1), 98.0))
+            # Auxiliary command channel errors
+            err_aux_tr = torch.mean(torch.abs(t_X[:, :, 1:] - x0_rec_tr[:, :, 1:]), dim=-1).cpu().numpy()
+
+            # Calibrate 97.5th and 96.5th percentiles strictly on nominal training distribution
+            tau_p0 = float(np.percentile(err_p0_tr, 97.5))
+            tau_win_p0 = float(np.percentile(np.percentile(err_p0_tr, 90, axis=1), 96.5))
 
         # ----------------------------------------------------------------------
-        # D. Map Candidate Windows onto True 32-step Physical Time Grid (M mask)
+        # D. Precision False-Alarm Filter & Selective Window Confirmation
         # ----------------------------------------------------------------------
         l2_flags = np.zeros_like(l1_flags)
         l2_scores = np.zeros(len(X_test_norm), dtype=np.float32)
 
         burst_id = (delta_t > 1.0).cumsum()
-        win_hf_ratios = []
         chan_wins_kept = 0
         chan_wins_total = len(df_c_win)
 
         orig_to_pos = {idx: i for i, idx in enumerate(orig_idx)}
+
+        # Channel candidate window scores distribution
+        win_scores_list = []
+        if meta["win_score_col"] and meta["win_score_col"] in df_c_win:
+            chan_l1_p45 = float(df_c_win[meta["win_score_col"]].quantile(0.45))
+        else:
+            chan_l1_p45 = 0.0
+
+        all_test_e_p0 = np.zeros(len(X_test_norm), dtype=np.float32)
+        all_test_e_p0_hf = np.zeros(len(X_test_norm), dtype=np.float32)
+        all_test_e_p0_lf = np.zeros(len(X_test_norm), dtype=np.float32)
+        all_test_e_aux = np.zeros(len(X_test_norm), dtype=np.float32)
 
         for _, w_row in df_c_win.iterrows():
             total_windows_evaluated += 1
@@ -475,7 +503,6 @@ def run_layer2():
                 os_idx = int(w_row[meta["orig_s_col"]])
                 t_orig = os_idx
 
-            # Center physical grid of size WIN_SIZE around trigger
             g_start = max(0, t_orig - (WIN_SIZE // 2))
             g_end = g_start + WIN_SIZE
 
@@ -502,67 +529,72 @@ def run_layer2():
 
             with torch.no_grad():
                 x0_r, pl_i, ph_i, pl_r, ph_r = model.reconstruct_window(wx, wm)
-                e_ph = torch.abs(ph_i[0, observed_local_indices, 0]).cpu().numpy()
-                e_pl = torch.abs(pl_i[0, observed_local_indices, 0] - mu[0, 0]).cpu().numpy()
-                e_rec = torch.abs(wx[0, observed_local_indices, 0] - x0_r[0, observed_local_indices, 0]).cpu().numpy()
+                e_p0_hf = torch.abs(ph_i[0, observed_local_indices, 0] - ph_r[0, observed_local_indices, 0]).cpu().numpy()
+                e_p0_lf = torch.abs(pl_i[0, observed_local_indices, 0] - pl_r[0, observed_local_indices, 0]).cpu().numpy()
+                e_p0 = 0.5 * e_p0_hf + 0.5 * e_p0_lf
+                e_aux = torch.mean(torch.abs(wx[0, observed_local_indices, 1:] - x0_r[0, observed_local_indices, 1:]), dim=-1).cpu().numpy()
 
             obs_test_pos = np.array(observed_test_indices)
-            obs_raw = X_test_raw[obs_test_pos, 0]
-            raw_abs_dev = np.max(np.abs(obs_raw - mu[0, 0]))
+            all_test_e_p0[obs_test_pos] = np.maximum(all_test_e_p0[obs_test_pos], e_p0)
+            all_test_e_p0_hf[obs_test_pos] = np.maximum(all_test_e_p0_hf[obs_test_pos], e_p0_hf)
+            all_test_e_p0_lf[obs_test_pos] = np.maximum(all_test_e_p0_lf[obs_test_pos], e_p0_lf)
+            all_test_e_aux[obs_test_pos] = np.maximum(all_test_e_aux[obs_test_pos], e_aux)
 
-            # Physics-Guided Confirmation Conditions:
-            # 1. High-frequency transient spike exceeds nominal 98th percentile envelope
-            # 2. Low-frequency drift exceeds nominal 98th percentile envelope
-            # 3. Masked diffusion reconstruction error exceeds nominal 98th percentile
-            is_hf_spike = bool(np.max(e_ph) > max(ph_98 * 1.35, 0.04))
-            is_lf_drift = bool(np.max(e_pl) > max(pl_dev_98 * 1.20, 0.08))
-            is_diff_rec = bool(np.mean(e_rec) > tau_rec_win or np.max(e_rec) > tau_rec_step)
-            has_raw_dev = bool(raw_abs_dev > max(train_std_0 * 1.5, 0.03))
+            sub_raw_p0 = X_test_raw[obs_test_pos, 0]
+            raw_p0_range = float(np.ptp(sub_raw_p0))
+            raw_p0_dev = float(np.max(np.abs(sub_raw_p0 - train_mu_p0)) / (train_std_p0 + 1e-4))
 
-            confirmed = (not is_dead_flat_channel) and (is_hf_spike or is_lf_drift or is_diff_rec) and has_raw_dev
+            win_p0_p90 = float(np.percentile(e_p0, 90))
+            win_l1_score = float(w_row[meta["win_score_col"]]) if meta["win_score_col"] and meta["win_score_col"] in w_row else 0.0
+
+            # 3. Precision False-Alarm Filter
+            # Reject window if:
+            # a) Primary sensor is dead-flat/unchanged (raw_p0_range < 1e-3 and raw_p0_dev < 1.5)
+            # b) Both primary diffusion error and Layer 1 score are weak (bottom 45% of triggers without primary deviation)
+            is_flat_sensor = (raw_p0_range < 1e-3 and raw_p0_dev < 1.5)
+            is_weak_diff_and_l1 = (win_p0_p90 < tau_win_p0 and win_l1_score <= chan_l1_p45 and raw_p0_dev < 2.5)
+
+            reject_window = is_flat_sensor or is_weak_diff_and_l1
             has_gt = bool(np.any(y_true[obs_test_pos] == 1))
 
-            if confirmed:
+            if not reject_window:
                 chan_wins_kept += 1
                 if has_gt:
                     true_anom_wins_kept += 1
 
-                # Confirm anomalous steps inside window
-                w_step_scores = 0.5 * e_ph + 0.5 * e_pl
-                step_anom = (w_step_scores > np.percentile(w_step_scores, 60)) | (l1_flags[obs_test_pos] == 1)
-                l2_flags[obs_test_pos[step_anom]] = 1
-                l2_scores[obs_test_pos] = np.maximum(l2_scores[obs_test_pos], w_step_scores)
+                # Keep union of Layer 1 high-confidence flags and steps where primary diffusion error exceeds threshold
+                active_steps = (e_p0 > tau_p0 * 0.85) | (l1_flags[obs_test_pos] == 1)
+                confirmed_pos = obs_test_pos[active_steps]
+                l2_flags[confirmed_pos] = 1
+                l2_scores[obs_test_pos] = np.maximum(l2_scores[obs_test_pos], e_p0)
 
-                # Burst-aware propagation: confirm entire burst if >35% of burst is anomalous
-                for b_id in np.unique(burst_id[obs_test_pos[step_anom]]):
+                # Burst propagation: if >35% of burst is confirmed, confirm burst
+                for b_id in np.unique(burst_id[confirmed_pos]):
                     b_mask = (burst_id == b_id)
                     if np.mean(l2_flags[b_mask]) >= 0.35:
                         l2_flags[b_mask] = 1
-
-                # Root-Cause Ratios
-                hf_peak = float(np.max(e_ph))
-                lf_mean = float(np.mean(e_pl))
-                spikiness = hf_peak / (np.mean(e_ph) + 1e-4)
-                win_hf_ratios.append((spikiness, lf_mean, hf_peak))
             else:
                 total_windows_rejected += 1
                 if not has_gt:
                     false_alarm_wins_rejected += 1
 
-        # Determine Root-Cause Classification (Point vs Contextual)
-        if len(win_hf_ratios) == 0:
-            pred_type = "none"
-        else:
-            avg_spikiness = np.mean([r[0] for r in win_hf_ratios])
-            avg_lf = np.mean([r[1] for r in win_hf_ratios])
-            max_hf = np.max([r[2] for r in win_hf_ratios])
-            flagged_frac = np.mean(l2_flags)
-            
-            # Point anomalies are sharp localized transients with high spikiness and low duration
-            if (avg_spikiness > 2.8 or max_hf > ph_98 * 2.0) and flagged_frac < 0.12 and avg_lf < 1.5:
-                pred_type = "point"
-            else:
+        # ----------------------------------------------------------------------
+        # E. Accurate Physics Root-Cause Classifier (Point vs Contextual)
+        # ----------------------------------------------------------------------
+        aux_activity = float(np.mean(np.std(X_test_raw[:, 1:], axis=0) > 0.05))
+        flagged_mask = (l2_flags == 1)
+
+        if np.sum(l2_flags) > 0:
+            p0_kurtosis = float(np.max(all_test_e_p0_hf) / (np.mean(all_test_e_p0_hf) + 1e-5))
+            lf_to_hf = float(np.mean(all_test_e_p0_lf) / (np.mean(all_test_e_p0_hf) + 1e-5))
+            cmd_corr_ratio = float(np.mean(all_test_e_aux[flagged_mask]) / (np.mean(all_test_e_p0[flagged_mask]) + 1e-5))
+
+            if (cmd_corr_ratio > 0.45 and aux_activity > 0.12) or (p0_kurtosis < 2.8 and aux_activity > 0.20):
                 pred_type = "contextual"
+            else:
+                pred_type = "point"
+        else:
+            pred_type = "none"
 
         if np.any(y_true == 1) and pred_type != "none":
             total_classified_events += 1
@@ -571,7 +603,7 @@ def run_layer2():
 
         # Channel Metrics
         l2_f1 = f1_score(y_true, l2_flags, zero_division=0)
-        l2_pa_preds = compute_pa_predictions(y_true, l2_flags)
+        l2_pa_preds = compute_pa_predictions_event(y_true, l2_flags, orig_idx, gt_seqs)
         l2_paf1 = f1_score(y_true, l2_pa_preds, zero_division=0)
 
         rej_pct = ((chan_wins_total - chan_wins_kept) / max(1, chan_wins_total)) * 100.0
@@ -595,6 +627,7 @@ def run_layer2():
             "l2_windows_kept": chan_wins_kept,
             "l1_step_f1": l1_f1,
             "l2_step_f1": l2_f1,
+            "l1_pa_f1": l1_paf1,
             "l2_pa_f1": l2_paf1,
             "pred_type": pred_type,
             "gt_type": gt_primary_type
@@ -615,12 +648,16 @@ def run_layer2():
     y_l1_pred = df_all_out[meta["flag_col"]].values.astype(int)
     y_l2_pred = df_all_out["l2_flag"].values.astype(int)
 
-    # Point-Adjusted (PA) vectors per channel
+    # Compute Point-Adjusted (PA) vectors per channel using exact ground-truth sequences
     pa_l1_list, pa_l2_list = [], []
     for cid, grp in df_all_out.groupby("chan_id", sort=False):
         yt = grp["Is_Anomaly"].values.astype(int)
-        pa_l1_list.append(compute_pa_predictions(yt, grp[meta["flag_col"]].values.astype(int)))
-        pa_l2_list.append(compute_pa_predictions(yt, grp["l2_flag"].values.astype(int)))
+        orig = grp[meta["idx_col"]].values.astype(int)
+        seqs = df_labels[df_labels["chan_id"] == cid].iloc[0]["anomaly_sequences"]
+        
+        pa_l1_list.append(compute_pa_predictions_event(yt, grp[meta["flag_col"]].values.astype(int), orig, seqs))
+        pa_l2_list.append(compute_pa_predictions_event(yt, grp["l2_flag"].values.astype(int), orig, seqs))
+
     y_l1_pa = np.concatenate(pa_l1_list)
     y_l2_pa = np.concatenate(pa_l2_list)
 
