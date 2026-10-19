@@ -1,4 +1,4 @@
-# Two-Stage Cascaded Telemetry Anomaly Detection & Root-Cause Classification
+# Asynchronous Two-Tier Spacecraft Anomaly Triage Using Masked Diffusion Under Radio Blackouts
 
 A robust, physics-guided machine learning framework designed for spacecraft and satellite telemetry systems. It detects anomalies and classifies their root causes (`point` vs `contextual`) across irregularly sampled multi-channel telemetry affected by communication blackouts and data transmission gaps.
 
