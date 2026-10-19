@@ -69,7 +69,7 @@ WIN_SIZE = 32
 DIFF_STEPS = 20
 HIDDEN_DIM = 64
 BATCH_SIZE = 64
-MAX_EPOCHS = 8
+MAX_EPOCHS = 6
 LR = 3e-3
 PATIENCE = 3
 
@@ -339,8 +339,10 @@ def run_layer2():
     true_anom_wins_kept = 0
     false_alarm_wins_rejected = 0
 
-    correct_root_cause = 0
-    total_classified_events = 0
+    correct_root_cause_detected = 0
+    total_classified_detected = 0
+    correct_root_cause_active = 0
+    total_classified_active = 0
 
     t_pipeline_start = time.perf_counter()
 
@@ -395,13 +397,19 @@ def run_layer2():
 
         train_mu_p0 = float(train_mu[0, 0])
         train_std_p0 = float(train_sigma[0, 0])
+        train_p0_std = float(np.std(train_mat[:, 0]))
+        train_p0_min = float(np.min(train_mat[:, 0]))
+        train_p0_max = float(np.max(train_mat[:, 0]))
+        train_p0_mean = float(np.mean(train_mat[:, 0]))
+        test_p0_std = float(np.std(X_test_raw[:, 0]))
+        active_aux_dims = int(np.sum(np.std(train_mat[:, 1:], axis=0) > 0.05))
 
         X_train_norm = np.clip((train_mat - train_mu) / train_sigma_safe, -8.0, 8.0)
         X_test_norm = np.clip((X_test_raw - train_mu) / train_sigma_safe, -8.0, 8.0)
 
         # Slice training windows with simulated blackout masks
         train_wins, train_masks = [], []
-        stride = 12
+        stride = 16
         for s in range(0, max(1, len(X_train_norm) - WIN_SIZE + 1), stride):
             w = X_train_norm[s:s + WIN_SIZE]
             if len(w) < WIN_SIZE:
@@ -541,20 +549,19 @@ def run_layer2():
             all_test_e_aux[obs_test_pos] = np.maximum(all_test_e_aux[obs_test_pos], e_aux)
 
             sub_raw_p0 = X_test_raw[obs_test_pos, 0]
-            raw_p0_range = float(np.ptp(sub_raw_p0))
-            raw_p0_dev = float(np.max(np.abs(sub_raw_p0 - train_mu_p0)) / (train_std_p0 + 1e-4))
+            abs_raw_diff = float(np.max(np.abs(sub_raw_p0 - train_p0_mean)))
+            out_of_bounds = float(np.max(np.maximum(0.0, sub_raw_p0 - train_p0_max) + np.maximum(0.0, train_p0_min - sub_raw_p0)))
+            win_std_p0 = float(np.std(sub_raw_p0))
 
-            win_p0_p90 = float(np.percentile(e_p0, 90))
-            win_l1_score = float(w_row[meta["win_score_col"]]) if meta["win_score_col"] and meta["win_score_col"] in w_row else 0.0
+            # The 3 Exact Physical Rejection Filters:
+            # 1) Dead/Flat Primary Sensor Filter:
+            is_dead_flat = (train_p0_std < 0.015 and out_of_bounds < 0.05) or (win_std_p0 < 0.005 and test_p0_std < 0.005)
+            # 2) Static Test Window Filter:
+            is_static_win = (win_std_p0 < 1e-4 and abs_raw_diff < 0.25) or (train_p0_std < 0.015 and win_std_p0 < 1e-4 and np.max(e_p0_hf) < tau_p0 * 1.35)
+            # 3) Diffusion Reconstruction Filter:
+            is_diff_rec = (np.percentile(e_p0, 90) < tau_win_p0 * 1.05 and np.max(e_p0_hf) < tau_p0 * 1.35 and abs_raw_diff < 2.5 * max(train_p0_std, 1e-3))
 
-            # 3. Precision False-Alarm Filter
-            # Reject window if:
-            # a) Primary sensor is dead-flat/unchanged (raw_p0_range < 1e-3 and raw_p0_dev < 1.5)
-            # b) Both primary diffusion error and Layer 1 score are weak (bottom 45% of triggers without primary deviation)
-            is_flat_sensor = (raw_p0_range < 1e-3 and raw_p0_dev < 1.5)
-            is_weak_diff_and_l1 = (win_p0_p90 < tau_win_p0 and win_l1_score <= chan_l1_p45 and raw_p0_dev < 2.5)
-
-            reject_window = is_flat_sensor or is_weak_diff_and_l1
+            reject_window = is_dead_flat or is_static_win or is_diff_rec
             has_gt = bool(np.any(y_true[obs_test_pos] == 1))
 
             if not reject_window:
@@ -562,44 +569,58 @@ def run_layer2():
                 if has_gt:
                     true_anom_wins_kept += 1
 
-                # Keep union of Layer 1 high-confidence flags and steps where primary diffusion error exceeds threshold
-                active_steps = (e_p0 > tau_p0 * 0.85) | (l1_flags[obs_test_pos] == 1)
+                # Keep steps where diffusion error exceeds threshold or L1 flag is active
+                active_steps = (e_p0 > tau_p0 * 0.75) | (l1_flags[obs_test_pos] == 1)
                 confirmed_pos = obs_test_pos[active_steps]
                 l2_flags[confirmed_pos] = 1
                 l2_scores[obs_test_pos] = np.maximum(l2_scores[obs_test_pos], e_p0)
 
-                # Burst propagation: if >35% of burst is confirmed, confirm burst
-                for b_id in np.unique(burst_id[confirmed_pos]):
-                    b_mask = (burst_id == b_id)
-                    if np.mean(l2_flags[b_mask]) >= 0.35:
-                        l2_flags[b_mask] = 1
+                # Do NOT expand flags across whole burst unless abs_raw_diff > 2.0 * train_p0_std
+                if abs_raw_diff > 2.0 * train_p0_std:
+                    for b_id in np.unique(burst_id[confirmed_pos]):
+                        b_mask = (burst_id == b_id)
+                        if np.mean(l2_flags[b_mask]) >= 0.35:
+                            l2_flags[b_mask] = 1
             else:
                 total_windows_rejected += 1
                 if not has_gt:
                     false_alarm_wins_rejected += 1
 
+        # Channel cap: if channel ends up with > 40% of its total test steps flagged, keep top 15% highest scores
+        if len(l2_flags) > 0 and np.mean(l2_flags) > 0.40:
+            flagged_scores = l2_scores[l2_flags == 1]
+            if len(flagged_scores) > 0:
+                p85 = float(np.percentile(flagged_scores, 85.0))
+                l2_flags = ((l2_flags == 1) & (l2_scores >= p85)).astype(int)
+
         # ----------------------------------------------------------------------
         # E. Accurate Physics Root-Cause Classifier (Point vs Contextual)
         # ----------------------------------------------------------------------
-        aux_activity = float(np.mean(np.std(X_test_raw[:, 1:], axis=0) > 0.05))
-        flagged_mask = (l2_flags == 1)
+        idx = np.where(l2_flags == 1)[0]
+        if len(idx) > 0:
+            med_hf = np.median(all_test_e_p0_hf[all_test_e_p0_hf > 0]) if np.any(all_test_e_p0_hf > 0) else np.median(all_test_e_p0_hf)
+            hf_impulse = float(np.max(all_test_e_p0_hf[idx]) / (med_hf + 1e-4))
+            sub_flagged = X_test_raw[idx, 0]
+            oob_excursion = float(np.max(np.maximum(0.0, sub_flagged - train_p0_max) + np.maximum(0.0, train_p0_min - sub_flagged)))
+            aux_cmd_coupling = float(np.mean(all_test_e_aux[idx]) / (np.mean(all_test_e_p0[idx]) + 1e-4))
 
-        if np.sum(l2_flags) > 0:
-            p0_kurtosis = float(np.max(all_test_e_p0_hf) / (np.mean(all_test_e_p0_hf) + 1e-5))
-            lf_to_hf = float(np.mean(all_test_e_p0_lf) / (np.mean(all_test_e_p0_hf) + 1e-5))
-            cmd_corr_ratio = float(np.mean(all_test_e_aux[flagged_mask]) / (np.mean(all_test_e_p0[flagged_mask]) + 1e-5))
-
-            if (cmd_corr_ratio > 0.45 and aux_activity > 0.12) or (p0_kurtosis < 2.8 and aux_activity > 0.20):
-                pred_type = "contextual"
-            else:
-                pred_type = "point"
+            is_point = (oob_excursion > 0.02) or (hf_impulse > 4.5 and aux_cmd_coupling < 0.85) or (active_aux_dims <= 3)
+            pred_type = "point" if is_point else "contextual"
         else:
             pred_type = "none"
 
-        if np.any(y_true == 1) and pred_type != "none":
-            total_classified_events += 1
+        l2_f1 = f1_score(y_true, l2_flags, zero_division=0)
+        l2_pa_preds = compute_pa_predictions_event(y_true, l2_flags, orig_idx, gt_seqs)
+        l2_paf1 = f1_score(y_true, l2_pa_preds, zero_division=0)
+
+        if l2_paf1 > 0:
+            total_classified_detected += 1
             if pred_type == gt_primary_type:
-                correct_root_cause += 1
+                correct_root_cause_detected += 1
+        if np.sum(y_true) > 0 and pred_type != "none":
+            total_classified_active += 1
+            if pred_type == gt_primary_type:
+                correct_root_cause_active += 1
 
         # Channel Metrics
         l2_f1 = f1_score(y_true, l2_flags, zero_division=0)
@@ -680,7 +701,8 @@ def run_layer2():
     l2_paf1 = f1_score(y_all_true, y_l2_pa, zero_division=0)
 
     fa_rej_rate = (total_windows_rejected / max(1, total_windows_evaluated)) * 100.0
-    cls_acc = (correct_root_cause / max(1, total_classified_events)) * 100.0
+    cls_acc_det = (correct_root_cause_detected / max(1, total_classified_detected)) * 100.0
+    cls_acc_act = (correct_root_cause_active / max(1, total_classified_active)) * 100.0
 
     dense_windows = len(df_all_out)
     cascade_speedup = dense_windows / max(1, total_windows_evaluated)
@@ -702,7 +724,8 @@ def run_layer2():
     print(f"  Total Candidate Windows Routed     : {total_windows_evaluated:,} (vs {dense_windows:,} dense sliding windows)", flush=True)
     print(f"  Diffusion Evaluations Saved        : {compute_saved_pct:.2f}% ({cascade_speedup:.1f}x Cascade Speedup)", flush=True)
     print(f"  Layer 1 Candidate Windows Rejected : {total_windows_rejected:,} / {total_windows_evaluated:,} ({fa_rej_rate:.1f}% Filtered)", flush=True)
-    print(f"  Root-Cause Classification Accuracy : {correct_root_cause} / {total_classified_events} ({cls_acc:.1f}% Point vs Contextual)", flush=True)
+    print(f"  Root-Cause Acc (Detected Channels) : {correct_root_cause_detected} / {total_classified_detected} ({cls_acc_det:.1f}% Point vs Contextual)", flush=True)
+    print(f"  Root-Cause Acc (Active Channels)   : {correct_root_cause_active} / {total_classified_active} ({cls_acc_act:.1f}% Point vs Contextual)", flush=True)
     print(f"  Total Layer 2 Execution Time       : {total_time:.2f} seconds", flush=True)
     print("=" * 78, flush=True)
     print(f"  Saved -> {os.path.join(OUT_DIR, 'layer2_results.parquet')}", flush=True)
