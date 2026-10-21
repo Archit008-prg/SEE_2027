@@ -1,0 +1,20 @@
+# ==============================================================================
+# Dependencies for Two-Stage Spacecraft Telemetry Anomaly Detection
+# ==============================================================================
+
+# Core numerical and scientific computing
+numpy>=1.24.0, <2.0.0      # Matrix math, FFT, and array manipulation
+
+# Telemetry data handling and serialization
+pandas>=2.0.0              # Telemetry dataframes and summary metrics
+pyarrow>=14.0.0            # High-performance Parquet file read/write
+
+# Machine learning & statistical modeling (Layer 1)
+scikit-learn>=1.3.0        # Isolation Forest, Ridge regression, Scalers, Metrics
+scipy>=1.10.0              # Gaussian smoothing kernels and statistical filters
+
+# Deep learning framework (Layer 2)
+torch>=2.0.0               # Masked PhysDiff 1D conditional diffusion backbone
+
+# Data visualization & plotting
+matplotlib>=3.7.0          # Telemetry plots and publication figures

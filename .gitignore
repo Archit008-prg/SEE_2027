@@ -6,3 +6,8 @@ __pycache__/
 # Large raw archive data (unzipped NASA benchmark files)
 nasa_smap_data/data/
 nasa_smap_data/irregular/
+
+# Visualizations and publication figures
+figures/
+generate_figures.py
+
